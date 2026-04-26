@@ -2,9 +2,10 @@ use crate::config::Value;
 use clap::Parser;
 use config::Hotkey;
 use evdev::{AttributeSet, Device, InputEventKind, Key};
+use futures_util::stream::FuturesUnordered;
 use nix::{
     sys::stat::{umask, Mode},
-    unistd::{setgid, setuid, Gid, Uid, User},
+    unistd::{Uid, User},
 };
 use signal_hook::consts::signal::*;
 use signal_hook_tokio::Signals;
@@ -12,16 +13,16 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     error::Error,
-    ffi::CString,
     fs::{self, File, OpenOptions, Permissions},
     io::{Read, Write},
-    os::unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
+    os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
-    process::{exit, id, Command, Stdio},
+    process::{exit, id, Stdio},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{ProcessExt, System, SystemExt};
+use tokio::process::Command;
 use tokio::time::Duration;
 use tokio::time::{sleep, Instant};
 use tokio::{select, sync::mpsc};
@@ -187,6 +188,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         });
 
+        let (children_tx, mut children_rx) =
+            tokio::sync::mpsc::channel::<tokio::process::Child>(100);
+        tokio::spawn(async move {
+            let mut children = FuturesUnordered::new();
+            loop {
+                tokio::select! {
+                    Some(mut child) = children_rx.recv() => {
+                        children.push(async move { child.wait().await });
+                    }
+                    Some(reaped) = children.next() => {
+                        let reaped = match reaped {
+                            Ok(reaped) => reaped,
+                            Err(e) => {
+                                log::error!("failed to reap child process: {e:?}");
+                                continue;
+                            }
+                        };
+                        if !reaped.success() {
+                            log::error!("command failed with exit code: {reaped:?}");
+                        }
+                    }
+                }
+            }
+        });
+
         // When we do receive a command, we spawn a new thread to execute the command
         // This thread is spawned in the user space and is used to execute the command and it
         // exits after the command is executed.
@@ -199,10 +225,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let user_uid = Uid::from_raw(invoking_uid);
             let user = User::from_uid(user_uid)
                 .expect("Failed to get user info")
-                .expect(&format!("User with UID {} not found", invoking_uid));
-
-            let username =
-                CString::new(user.name.as_str()).expect("Failed to convert username to CString");
+                .unwrap_or_else(|| panic!("User with UID {} not found", invoking_uid));
 
             let mut cmd = Command::new("sh");
             cmd.arg("-c")
@@ -210,7 +233,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .uid(invoking_uid)
                 .gid(user.gid.as_raw())
                 .stdin(Stdio::null())
-                .stdout(match File::open(&log) {
+                .stdout(match File::options().append(true).open(&log) {
                     Ok(file) => file,
                     Err(e) => {
                         println!("Error: {}", e);
@@ -218,7 +241,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         exit(1);
                     }
                 })
-                .stderr(match File::open(&log) {
+                .stderr(match File::options().append(true).open(&log) {
                     Ok(file) => file,
                     Err(e) => {
                         println!("Error: {}", e);
@@ -233,8 +256,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
 
             match cmd.spawn() {
-                Ok(_) => {
+                Ok(child) => {
                     log::info!("Command executed successfully.");
+                    match tokio::time::timeout(Duration::from_secs(1), children_tx.send(child))
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => log::error!("reaper crashed!"),
+                        Err(_elapsed) => log::error!("reaper queue is full!"),
+                    };
                 }
                 Err(e) => log::error!("Failed to execute command: {}", e),
             }
